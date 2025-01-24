@@ -1,0 +1,120 @@
+# Data Configuration
+datasets:
+  casia:
+    train_path: "data/raw/CASIA2.0/train"
+    val_path: "data/raw/CASIA2.0/val"
+    test_path: "data/raw/CASIA2.0/test"
+    authentic_dir: "authentic"
+    tampered_dir: "tampered"
+    mask_dir: "masks"
+
+  faceforensics:
+    train_path: "data/raw/FaceForensics/train"
+    val_path: "data/raw/FaceForensics/val"
+    test_path: "data/raw/FaceForensics/test"
+    methods:
+      - "DeepFakes"
+      - "Face2Face"
+      - "FaceSwap"
+      - "NeuralTextures"
+    compression_levels:
+      - "raw"
+      - "c23"
+      - "c40"
+
+preprocessing:
+  resize:
+    size: 512
+    keep_aspect_ratio: true
+    interpolation: "lanczos"
+    pad_mode: "reflect"
+
+  color_convert:
+    to_rgb: true
+    to_ycbcr: true
+    to_hsv: true
+    to_lab: true
+
+  enhance:
+    brightness: true
+    contrast: true
+    sharpness: true
+
+  noise_analysis:
+    estimate_noise: true
+    denoise_method: "gaussian"
+
+  edge_detection:
+    method: "canny"
+    low_threshold: 100
+    high_threshold: 200
+
+  texture_analysis:
+    lbp: true
+    glcm: true
+    gabor: true
+
+  quality_assessment:
+    sharpness: true
+    noise_level: true
+    jpeg_quality: true
+
+augmentation:
+  geometric:
+    rotate:
+      enable: true
+      angle_range: [-45, 45]
+    flip:
+      horizontal: true
+      vertical: false
+    scale:
+      enable: true
+      range: [0.8, 1.2]
+    shear:
+      enable: true
+      range: [-0.2, 0.2]
+
+  photometric:
+    brightness:
+      enable: true
+      range: [0.8, 1.2]
+    contrast:
+      enable: true
+      range: [0.8, 1.2]
+    hue:
+      enable: true
+      range: [-0.1, 0.1]
+    saturation:
+      enable: true
+      range: [0.8, 1.2]
+
+  noise:
+    gaussian:
+      enable: true
+      mean: 0
+      std: [0.01, 0.05]
+    poisson:
+      enable: true
+    speckle:
+      enable: true
+      std: [0.01, 0.05]
+
+  blur:
+    gaussian:
+      enable: true
+      kernel_range: [3, 7]
+    motion:
+      enable: true
+      kernel_range: [3, 7]
+
+  compression:
+    jpeg:
+      enable: true
+      quality_range: [60, 100]
+
+batch_size:
+  train: 32
+  val: 64
+  test: 64
+
+num_workers: 8

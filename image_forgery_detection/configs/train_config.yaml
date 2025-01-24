@@ -1,0 +1,48 @@
+# Training Configuration
+training:
+  epochs: 100
+  early_stopping_patience: 10
+  gradient_clip_val: 1.0
+
+optimizer:
+  name: "adam"
+  params:
+    lr: 0.001
+    weight_decay: 0.0001
+
+scheduler:
+  name: "cosine"
+  params:
+    T_max: 100
+    eta_min: 1e-6
+
+loss:
+  classification:
+    name: "focal"
+    params:
+      alpha: 0.25
+      gamma: 2.0
+  segmentation:
+    name: "dice"
+    weight: 1.0
+  consistency:
+    name: "mse"
+    weight: 0.1
+
+metrics:
+  - accuracy
+  - precision
+  - recall
+  - f1
+  - auc
+
+checkpointing:
+  save_dir: "outputs/models"
+  save_top_k: 3
+  monitor: "val_f1"
+  mode: "max"
+
+logging:
+  project_name: "image_forgery_detection"
+  save_dir: "logs"
+  log_every_n_steps: 50

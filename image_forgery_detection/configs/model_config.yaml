@@ -1,0 +1,41 @@
+# Model Configuration
+model:
+  name: "ForgeryDetectionNet"
+  backbone:
+    name: "efficientnet_b3"
+    pretrained: true
+    frozen_stages: 3
+
+  neck:
+    type: "FPN"
+    in_channels: [40, 80, 192, 480]
+    out_channels: 256
+
+  head:
+    classification:
+      hidden_dims: [1024, 512]
+      dropout: 0.5
+      num_classes: 2
+
+    segmentation:
+      decoder_channels: [256, 128, 64, 32]
+      encoder_channels: [480, 192, 80, 40]
+
+  self_attention:
+    enabled: true
+    num_heads: 8
+    dropout: 0.1
+
+  auxiliary_tasks:
+    noise_level:
+      enabled: true
+      weight: 0.2
+    edge_consistency:
+      enabled: true
+      weight: 0.3
+
+inference:
+  tta_enabled: true
+  test_time_dropout: true
+  threshold: 0.5
+  min_area: 100
