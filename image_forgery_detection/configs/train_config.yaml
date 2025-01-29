@@ -1,48 +1,244 @@
-# Training Configuration
 training:
   epochs: 100
-  early_stopping_patience: 10
-  gradient_clip_val: 1.0
+  early_stopping:
+    enabled: true
+    patience: 10
+    min_delta: 0.001
+    monitor: "val_loss"
+    mode: "min"
+
+  gradient:
+    clip_norm: 1.0
+    accumulation_steps: 1
+    centralized: true
+    sync_bn: true
+
+  mixed_precision:
+    enabled: true
+    dtype: "float16"
+    dynamic_scale: true
+    init_scale: 65536.0
+
+  # 课程学习配置
+  curriculum:
+    enabled: true
+    difficulty_metrics:
+      - name: "tampering_complexity"
+        weight: 0.4
+      - name: "edge_clarity"
+        weight: 0.3
+      - name: "texture_consistency"
+        weight: 0.3
+    scheduling:
+      start_ratio: 0.3
+      end_ratio: 1.0
+      strategy: "linear"  # or "exponential"
+      warmup_epochs: 5
+      update_freq: 1
+
+  # 增量学习配置
+  incremental:
+    enabled: true
+    knowledge_distillation:
+      enabled: true
+      temperature: 2.0
+      alpha: 0.5
+      teacher_model: "best_model.pth"
+
+    experience_replay:
+      enabled: true
+      buffer_size: 1000
+      sample_strategy: "random"
+      update_strategy: "fifo"
+
+    regularization:
+      method: "ewc"  # elastic weight consolidation
+      lambda: 5000
+      alpha: 0.9
+      update_freq: 1
 
 optimizer:
-  name: "adam"
+  name: "adamw"
   params:
     lr: 0.001
-    weight_decay: 0.0001
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+    eps: 1e-8
+    amsgrad: false
+
+  layer_lrs:
+    backbone: 0.0001
+    encoder: 0.001
+    decoder: 0.001
+    head: 0.001
+
+  layer_decay:
+    enabled: true
+    decay_rate: 0.7
+    decay_steps: 3
 
 scheduler:
-  name: "cosine"
+  name: "one_cycle"
   params:
-    T_max: 100
-    eta_min: 1e-6
+    max_lr: 0.001
+    pct_start: 0.3
+    anneal_strategy: "cos"
+    div_factor: 25.0
+    final_div_factor: 1e4
+
+  warmup:
+    enabled: true
+    type: "linear"
+    epochs: 5
+    start_factor: 0.1
 
 loss:
   classification:
     name: "focal"
+    weight: 1.0
     params:
       alpha: 0.25
       gamma: 2.0
+    focal_weight: true
+
   segmentation:
     name: "dice"
     weight: 1.0
-  consistency:
-    name: "mse"
-    weight: 0.1
+    params:
+      smooth: 1.0
+    aux_losses:
+      - name: "bce"
+        weight: 0.5
+      - name: "lovasz"
+        weight: 0.3
 
-metrics:
-  - accuracy
-  - precision
-  - recall
-  - f1
-  - auc
+  auxiliary:
+    noise_level:
+      name: "mse"
+      weight: 0.2
+    edge_consistency:
+      name: "bce"
+      weight: 0.3
+
+  regularization:
+    l1: 0.0001
+    l2: 0.0001
+    orthogonal: 0.001
+
+# 评估与监控配置
+evaluation:
+  metrics:
+    classification:
+      - name: "accuracy"
+        threshold: 0.5
+      - name: "precision"
+        average: "macro"
+      - name: "recall"
+        average: "macro"
+      - name: "f1"
+        average: "macro"
+      - name: "roc_auc"
+        multi_class: "ovr"
+      - name: "pr_auc"
+        average: "macro"
+
+    segmentation:
+      - name: "iou"
+        threshold: 0.5
+      - name: "dice"
+        threshold: 0.5
+      - name: "boundary_iou"
+        threshold: 0.5
+
+    efficiency:
+      measure_latency: true
+      measure_throughput: true
+      measure_memory: true
+      measure_flops: true
+
+    confidence:
+      calibration_error: true
+      reliability_diagram: true
+      confidence_histogram: true
+
+  validation:
+    freq: 1
+    save_predictions: true
+    num_samples: 100
+    visualize: true
 
 checkpointing:
   save_dir: "outputs/models"
-  save_top_k: 3
-  monitor: "val_f1"
-  mode: "max"
+  save_freq: 1
+  save_best: true
+  save_last: true
+  max_keep: 5
+  resume: null
+  auto_resume: true
+  file_format: "pytorch"  # or "safetensors"
 
 logging:
-  project_name: "image_forgery_detection"
   save_dir: "logs"
-  log_every_n_steps: 50
+  log_freq: 50
+
+  metrics:
+    - "loss"
+    - "accuracy"
+    - "precision"
+    - "recall"
+    - "f1"
+    - "iou"
+    - "learning_rate"
+    - "gpu_memory"
+    - "throughput"
+
+  visualization:
+    enabled: true
+    save_path: "logs/viz"
+    max_images: 16
+    save_format: "png"
+
+  wandb:
+    enabled: true
+    project: "forgery_detection"
+    name: null
+    group: null
+    tags: []
+    save_code: true
+    log_freq: 50
+
+  tensorboard:
+    enabled: true
+    log_freq: 50
+    flush_secs: 30
+
+# 性能监控配置
+monitoring:
+  system:
+    gpu_memory_threshold: 0.9
+    cpu_memory_threshold: 0.8
+    temperature_threshold: 80
+
+  training:
+    loss_spike_threshold: 5.0
+    gradient_norm_threshold: 1000
+    learning_rate_threshold: 0.1
+
+  alerts:
+    enabled: true
+    methods: ["email", "slack"]
+    threshold_check_frequency: 100
+
+distributed:
+  backend: "nccl"
+  strategy: "ddp"
+  sync_bn: true
+  find_unused_parameters: false
+  gradient_as_bucket_view: true
+  broadcast_buffers: true
+
+reproducibility:
+  seed: 42
+  deterministic: true
+  benchmark: false
+  cudnn_deterministic: true

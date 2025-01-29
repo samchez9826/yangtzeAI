@@ -1,41 +1,195 @@
-# Model Configuration
 model:
-  name: "ForgeryDetectionNet"
+  name: "ForgeryDetector"
+
+  # 自监督预训练配置
+  self_supervised:
+    enabled: true
+    method: "simclr"
+    projection_head:
+      dims: [2048, 512, 128]
+      activation: "relu"
+      norm: "batch"
+    contrastive:
+      temperature: 0.07
+      queue_size: 65536
+      momentum: 0.999
+      negative_samples: 4096
+    local_global:
+      enabled: true
+      grid_size: 7
+      temperature: 0.1
+    dense_cl:
+      enabled: true
+      feature_dim: 128
+      queue_size: 65536
+    losses:
+      infonce_weight: 1.0
+      local_weight: 0.5
+      consistency_weight: 0.3
+
   backbone:
     name: "efficientnet_b3"
     pretrained: true
     frozen_stages: 3
+    features_only: true
+    out_indices: [1, 2, 3, 4]
+    drop_path_rate: 0.2
+    activation: "swish"
+    checkpoint: false
 
-  neck:
-    type: "FPN"
+  encoder:
+    type: "pyramid"
     in_channels: [40, 80, 192, 480]
     out_channels: 256
+    attention:
+      enabled: true
+      type: "cbam"
+      reduction: 16
+      spatial: true
+    feature_fusion:
+      type: "weighted_sum"
+      adaptive: true
+    neck:
+      type: "fpn"
+      upsample_mode: "bilinear"
+      use_p6p7: true
 
-  head:
-    classification:
-      hidden_dims: [1024, 512]
-      dropout: 0.5
-      num_classes: 2
+  decoder:
+    type: "fpn"
+    in_channels: [256, 256, 256, 256]
+    out_channels: 256
+    skip_connections: true
+    feature_aggregation: "sum"
+    upsampling: "bilinear"
+    attention:
+      enabled: true
+      type: "se"
+      reduction: 16
 
-    segmentation:
-      decoder_channels: [256, 128, 64, 32]
-      encoder_channels: [480, 192, 80, 40]
-
-  self_attention:
+  # 多任务学习配置
+  multitask:
     enabled: true
-    num_heads: 8
-    dropout: 0.1
+    tasks:
+      classification:
+        enabled: true
+        weight: 1.0
+        hidden_dims: [1024, 512]
+        dropout: 0.5
+        num_classes: 2
+        activation: "sigmoid"
+
+      segmentation:
+        enabled: true
+        weight: 1.0
+        decoder_channels: [256, 128, 64, 32]
+        encoder_channels: [480, 192, 80, 40]
+        aux_params:
+          dropout: 0.5
+          classes: 1
+        activation: "sigmoid"
+
+      forgery_type:
+        enabled: true
+        weight: 0.3
+        num_classes: 4
+        hidden_dims: [512, 256]
+        dropout: 0.5
+
+      quality_assessment:
+        enabled: true
+        weight: 0.2
+        output_dim: 1
+        hidden_dims: [256, 128]
+
+      semantic_consistency:
+        enabled: true
+        weight: 0.2
+        feature_dim: 256
+        temperature: 0.07
 
   auxiliary_tasks:
     noise_level:
       enabled: true
       weight: 0.2
+      hidden_dims: [256, 128]
+      dropout: 0.3
+
     edge_consistency:
       enabled: true
       weight: 0.3
+      kernel_size: 3
+      loss_type: "l1"
+
+  # 场景适应模块
+  scene_adaptation:
+    enabled: true
+    feature_fusion:
+      method: "attention"
+      num_heads: 8
+      dropout: 0.1
+      dim_feedforward: 1024
+
+    strategy_selection:
+      enabled: true
+      decision_method: "learned"  # or "rule_based"
+      feature_dim: 256
+      hidden_dims: [128, 64]
+      num_strategies: 4
+
+fusion:
+  type: "attention"
+  attention_type: "self"
+  num_heads: 8
+  dropout: 0.1
+  dim_feedforward: 2048
+  num_layers: 3
+  activation: "gelu"
+  layer_norm_eps: 1e-5
+  batch_first: true
 
 inference:
   tta_enabled: true
   test_time_dropout: true
-  threshold: 0.5
-  min_area: 100
+  ensemble_method: "weighted_average"
+  post_processing:
+    enabled: true
+    min_size: 100
+    threshold: 0.5
+    nms_threshold: 0.3
+    mask_refinement:
+      enabled: true
+      method: "crf"
+      params:
+        bilateral_sxy: 80
+        bilateral_rgb: 13
+        iterations: 5
+
+  # 推理优化配置
+  optimization:
+    quantization:
+      enabled: true
+      dtype: "int8"
+      calibration_method: "percentile"
+
+    pruning:
+      enabled: true
+      method: "l1"
+      sparsity: 0.5
+
+    knowledge_distillation:
+      enabled: true
+      temperature: 2.0
+      alpha: 0.5
+
+    graph_optimization:
+      fuse_bn: true
+      fuse_conv_bn: true
+      fold_constants: true
+      optimize_padding: true
+
+  deployment:
+    export_format: "onnx"
+    opset_version: 13
+    simplify: true
+    dynamic_axes: true
+    batch_size: 1

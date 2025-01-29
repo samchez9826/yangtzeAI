@@ -7,6 +7,10 @@ datasets:
     authentic_dir: "authentic"
     tampered_dir: "tampered"
     mask_dir: "masks"
+    metadata:
+      num_authentic: 7491
+      num_tampered: 5123
+      size_range: [384, 6000]
 
   faceforensics:
     train_path: "data/raw/FaceForensics/train"
@@ -21,6 +25,10 @@ datasets:
       - "raw"
       - "c23"
       - "c40"
+    metadata:
+      videos_per_method: 1000
+      video_length: 300
+      fps: 30
 
 preprocessing:
   resize:
@@ -28,51 +36,139 @@ preprocessing:
     keep_aspect_ratio: true
     interpolation: "lanczos"
     pad_mode: "reflect"
+    edge_preserve:
+      enabled: true
+      method: "bilateral"
+      params:
+        d: 9
+        sigma_color: 75
+        sigma_space: 75
 
   color_convert:
-    to_rgb: true
-    to_ycbcr: true
-    to_hsv: true
-    to_lab: true
+    to_rgb:
+      enabled: true
+      normalize: true
+    to_ycbcr:
+      enabled: true
+      keep_channels: [true, true, true]
+    to_hsv:
+      enabled: true
+      normalize: true
+    to_lab:
+      enabled: true
+      normalize: true
+
+  scene_analysis:
+    enabled: true
+    pretrained_model: "resnet50"
+    feature_extraction:
+      global: true
+      local: true
+      backbone: "resnet50"
+      output_layers: ["layer2", "layer3", "layer4"]
+    semantic_segmentation:
+      enabled: true
+      model: "deeplabv3_plus"
+      num_classes: 20
+      confidence_threshold: 0.5
+
+  illumination:
+    enabled: true
+    direction_estimation: true
+    shadow_detection:
+      enabled: true
+      threshold: 0.3
+    highlight_analysis:
+      enabled: true
+      threshold: 0.8
+    uniformity_assessment:
+      enabled: true
+      grid_size: 8
 
   enhance:
-    brightness: true
-    contrast: true
-    sharpness: true
+    brightness:
+      enabled: true
+      factor_range: [0.8, 1.2]
+    contrast:
+      enabled: true
+      factor_range: [0.8, 1.2]
+    sharpness:
+      enabled: true
+      factor_range: [0.8, 1.2]
 
   noise_analysis:
     estimate_noise: true
     denoise_method: "gaussian"
+    params:
+      kernel_size: 3
+      sigma: 1.0
+    metrics:
+      - "psnr"
+      - "ssim"
+      - "noise_variance"
 
   edge_detection:
     method: "canny"
     low_threshold: 100
     high_threshold: 200
+    additional_methods:
+      - "sobel"
+      - "laplacian"
+    edge_refinement: true
 
   texture_analysis:
-    lbp: true
-    glcm: true
-    gabor: true
+    lbp:
+      enabled: true
+      radius: 3
+      points: 24
+    glcm:
+      enabled: true
+      distances: [1, 2, 3]
+      angles: [0, 45, 90, 135]
+    gabor:
+      enabled: true
+      frequencies: [0.1, 0.25, 0.4]
+      orientations: [0, 45, 90, 135]
 
   quality_assessment:
-    sharpness: true
-    noise_level: true
-    jpeg_quality: true
+    sharpness:
+      enabled: true
+      method: "laplacian_variance"
+    noise_level:
+      enabled: true
+      method: "standard_deviation"
+    jpeg_quality:
+      enabled: true
+      method: "dct_statistics"
+    blur_detection:
+      enabled: true
+      method: "frequency_analysis"
+    compression_artifacts:
+      enabled: true
+      method: "blocking_effect"
 
 augmentation:
   geometric:
     rotate:
       enable: true
       angle_range: [-45, 45]
+      interpolation: "bilinear"
+      fill_mode: "reflect"
     flip:
       horizontal: true
       vertical: false
     scale:
       enable: true
       range: [0.8, 1.2]
+      interpolation: "bilinear"
     shear:
       enable: true
       range: [-0.2, 0.2]
+      interpolation: "bilinear"
+    elastic:
+      enable: true
+      alpha: 1.0
+      sigma: 50
 
   photometric:
     brightness:
@@ -87,6 +183,9 @@ augmentation:
     saturation:
       enable: true
       range: [0.8, 1.2]
+    gamma:
+      enable: true
+      range: [0.8, 1.2]
 
   noise:
     gaussian:
@@ -95,15 +194,24 @@ augmentation:
       std: [0.01, 0.05]
     poisson:
       enable: true
+      lambda_range: [0.8, 1.2]
     speckle:
       enable: true
       std: [0.01, 0.05]
+    salt_pepper:
+      enable: true
+      amount: [0.01, 0.03]
 
   blur:
     gaussian:
       enable: true
       kernel_range: [3, 7]
+      sigma_range: [0.5, 1.5]
     motion:
+      enable: true
+      kernel_range: [3, 7]
+      angle_range: [0, 360]
+    defocus:
       enable: true
       kernel_range: [3, 7]
 
@@ -111,6 +219,20 @@ augmentation:
     jpeg:
       enable: true
       quality_range: [60, 100]
+    webp:
+      enable: true
+      quality_range: [60, 100]
+
+  mix:
+    mixup:
+      enable: true
+      alpha: 0.2
+    cutmix:
+      enable: true
+      alpha: 1.0
+    mosaic:
+      enable: true
+      grid_size: 2
 
 batch_size:
   train: 32
@@ -118,3 +240,9 @@ batch_size:
   test: 64
 
 num_workers: 8
+
+memory_management:
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true
+  max_memory_allocated: "12GB"
