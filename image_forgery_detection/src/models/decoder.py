@@ -1,423 +1,395 @@
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
-from typing import Dict, List, Optional, Tuple, Union
 import torch.nn.functional as F
+import math
+from typing import Dict, List, Optional, Tuple, Union, Type
+from dataclasses import dataclass
+from abc import ABC, abstractmethod
 
 
-class DecoderBase(nn.Module):
+@dataclass
+class DecoderConfig:
+    """配置数据类"""
+    in_channels: List[int]
+    out_channels: int
+    skip_channels: Optional[List[int]] = None
+    dropout: float = 0.1
+    use_bias: bool = False
+    attention_heads: int = 8
+    dim_feedforward: int = 2048
+    max_len: int = 10000
+    pos_encoding_scale: float = 1.0
+
+
+class DecoderBase(nn.Module, ABC):
     """解码器基类"""
 
-    def __init__(self,
-                 in_channels: List[int],
-                 out_channels: int,
-                 skip_channels: Optional[List[int]] = None):
-        """
-        初始化解码器
-        Args:
-            in_channels: 输入通道数列表
-            out_channels: 输出通道数
-            skip_channels: 跳跃连接通道数列表
-        """
+    def __init__(self, config: DecoderConfig):
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.skip_channels = skip_channels
-
+        self.config = config
         self.initialize_layers()
+        self._init_weights()
 
-    def initialize_layers(self):
-        """初始化层"""
+    @abstractmethod
+    def initialize_layers(self) -> None:
         raise NotImplementedError
 
+    def _init_weights(self) -> None:
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    @abstractmethod
     def forward(self, features: Union[torch.Tensor, List[torch.Tensor]],
-                skip_features: Optional[List[torch.Tensor]] = None) -> torch.Tensor:
-        """前向传播"""
+                skip_features: Optional[List[torch.Tensor]] = None) -> Union[torch.Tensor, List[torch.Tensor]]:
         raise NotImplementedError
 
 
 class FPNDecoder(DecoderBase):
     """特征金字塔解码器"""
 
-    def initialize_layers(self):
-        """初始化层"""
+    def initialize_layers(self) -> None:
         # 横向连接
         self.lateral_convs = nn.ModuleList([
-            nn.Conv2d(in_channels, self.out_channels, kernel_size=1)
-            for in_channels in self.in_channels
+            nn.Sequential(
+                nn.Conv2d(in_channels, self.config.out_channels, 1,
+                          bias=self.config.use_bias),
+                nn.BatchNorm2d(self.config.out_channels),
+                nn.ReLU(inplace=True)
+            ) for in_channels in self.config.in_channels
         ])
 
         # 特征融合
         self.fpn_convs = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(self.out_channels, self.out_channels,
-                          kernel_size=3, padding=1),
-                nn.BatchNorm2d(self.out_channels),
-                nn.ReLU(inplace=True)
-            ) for _ in range(len(self.in_channels))
+                nn.Conv2d(self.config.out_channels, self.config.out_channels, 3,
+                          padding=1, bias=self.config.use_bias),
+                nn.BatchNorm2d(self.config.out_channels),
+                nn.ReLU(inplace=True),
+                nn.Dropout2d(self.config.dropout)
+            ) for _ in range(len(self.config.in_channels))
         ])
 
+    @torch.cuda.amp.autocast()
     def forward(self, features: List[torch.Tensor],
                 skip_features: Optional[List[torch.Tensor]] = None) -> List[torch.Tensor]:
-        """
-        前向传播
-        Args:
-            features: 编码器特征列表
-            skip_features: 跳跃连接特征列表
-        Returns:
-            解码器特征列表
-        """
         # 横向连接
         laterals = [
-            conv(feat) for feat, conv in zip(features, self.lateral_convs)
+            lateral_conv(feat) for feat, lateral_conv in zip(features, self.lateral_convs)
         ]
 
-        # 自顶向下的路径
+        # 自顶向下特征融合
         for i in range(len(laterals) - 1, 0, -1):
-            # 上采样高层特征
-            upsampled = F.interpolate(
+            laterals[i - 1] = laterals[i - 1] + F.interpolate(
                 laterals[i],
                 size=laterals[i - 1].shape[-2:],
                 mode='nearest'
             )
-            # 特征融合
-            laterals[i - 1] = laterals[i - 1] + upsampled
 
-        # 最终卷积
-        outs = [
-            conv(lateral) for lateral, conv in zip(laterals, self.fpn_convs)
+        # 特征精炼
+        return [
+            fpn_conv(lateral) for lateral, fpn_conv in zip(laterals, self.fpn_convs)
         ]
-
-        return outs
 
 
 class UNetDecoder(DecoderBase):
     """UNet解码器"""
 
-    def initialize_layers(self):
-        """初始化层"""
+    def initialize_layers(self) -> None:
         self.decoder_blocks = nn.ModuleList()
 
-        # 创建解码块
-        for i in range(len(self.in_channels)):
-            skip_channel = self.skip_channels[i] if self.skip_channels else 0
-            in_channel = self.in_channels[i] + skip_channel
+        for i in range(len(self.config.in_channels)):
+            skip_channel = self.config.skip_channels[i] if self.config.skip_channels else 0
+            in_channel = self.config.in_channels[i] + skip_channel
 
             block = nn.Sequential(
-                nn.Conv2d(in_channel, self.out_channels,
-                          kernel_size=3, padding=1),
-                nn.BatchNorm2d(self.out_channels),
+                nn.Conv2d(in_channel, self.config.out_channels, 3, padding=1, bias=self.config.use_bias),
+                nn.BatchNorm2d(self.config.out_channels),
                 nn.ReLU(inplace=True),
-                nn.Conv2d(self.out_channels, self.out_channels,
-                          kernel_size=3, padding=1),
-                nn.BatchNorm2d(self.out_channels),
-                nn.ReLU(inplace=True)
+                nn.Conv2d(self.config.out_channels, self.config.out_channels, 3, padding=1, bias=self.config.use_bias),
+                nn.BatchNorm2d(self.config.out_channels),
+                nn.ReLU(inplace=True),
+                nn.Dropout2d(self.config.dropout)
             )
             self.decoder_blocks.append(block)
 
+    @torch.cuda.amp.autocast()
     def forward(self, features: List[torch.Tensor],
                 skip_features: Optional[List[torch.Tensor]] = None) -> torch.Tensor:
-        """
-        前向传播
-        Args:
-            features: 编码器特征列表
-            skip_features: 跳跃连接特征列表
-        Returns:
-            解码器特征
-        """
         x = features[-1]
 
         for i, block in enumerate(self.decoder_blocks):
             # 上采样
-            x = F.interpolate(x, scale_factor=2, mode='bilinear',
-                              align_corners=True)
+            x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
 
             # 跳跃连接
             if skip_features is not None:
-                skip = skip_features[-(i + 1)]
-                x = torch.cat([x, skip], dim=1)
+                x = torch.cat([x, skip_features[-(i + 1)]], dim=1)
 
-            # 解码块
             x = block(x)
 
         return x
 
 
 class ASPPDecoder(DecoderBase):
-    """带ASPP模块的解码器"""
+    """ASPP解码器"""
 
-    def initialize_layers(self):
-        """初始化层"""
-        dilations = [6, 12, 18]
+    def initialize_layers(self) -> None:
+        in_channels = self.config.in_channels[0]
+        out_channels = self.config.out_channels
 
         # ASPP分支
         self.aspp_blocks = nn.ModuleList([
             nn.Sequential(
-                nn.Conv2d(self.in_channels[0], self.out_channels,
-                          kernel_size=3, dilation=d, padding=d),
-                nn.BatchNorm2d(self.out_channels),
-                nn.ReLU(inplace=True)
-            ) for d in dilations
+                nn.Conv2d(in_channels, out_channels, 3, padding=d, dilation=d, bias=self.config.use_bias),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True),
+                nn.Dropout2d(self.config.dropout)
+            ) for d in [6, 12, 18]
         ])
 
-        # 1x1卷积分支
+        # 1x1 卷积
         self.aspp_blocks.append(nn.Sequential(
-            nn.Conv2d(self.in_channels[0], self.out_channels,
-                      kernel_size=1),
-            nn.BatchNorm2d(self.out_channels),
-            nn.ReLU(inplace=True)
+            nn.Conv2d(in_channels, out_channels, 1, bias=self.config.use_bias),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(self.config.dropout)
         ))
 
-        # 全局上下文分支
-        self.global_branch = nn.Sequential(
+        # 全局上下文
+        self.global_pool = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(self.in_channels[0], self.out_channels,
-                      kernel_size=1, bias=False),
-            nn.BatchNorm2d(self.out_channels),
+            nn.Conv2d(in_channels, out_channels, 1, bias=self.config.use_bias),
+            nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True)
         )
 
         # 特征融合
         self.fusion = nn.Sequential(
-            nn.Conv2d(self.out_channels * (len(self.aspp_blocks) + 1),
-                      self.out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(self.out_channels),
+            nn.Conv2d(out_channels * 5, out_channels, 1, bias=self.config.use_bias),
+            nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.5)
+            nn.Dropout2d(self.config.dropout)
         )
 
-        # 最终输出层
-        self.final_conv = nn.Sequential(
-            nn.Conv2d(self.out_channels, self.out_channels,
-                      kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(self.out_channels),
-            nn.ReLU(inplace=True)
-        )
-
+    @torch.cuda.amp.autocast()
     def forward(self, features: List[torch.Tensor],
                 skip_features: Optional[List[torch.Tensor]] = None) -> torch.Tensor:
-        """
-        前向传播
-        Args:
-            features: 编码器特征列表
-            skip_features: 跳跃连接特征列表
-        Returns:
-            解码器特征
-        """
         x = features[-1]
+        size = x.shape[-2:]
 
-        # ASPP分支
-        aspp_outs = []
-        for block in self.aspp_blocks:
-            aspp_outs.append(block(x))
+        # 并行处理ASPP分支
+        aspp_outs = [block(x) for block in self.aspp_blocks]
 
         # 全局上下文
-        global_context = self.global_branch(x)
-        global_context = F.interpolate(
-            global_context,
-            size=x.shape[2:],
-            mode='bilinear',
-            align_corners=True
-        )
-        aspp_outs.append(global_context)
+        global_context = self.global_pool(x)
+        global_context = F.interpolate(global_context, size=size, mode='bilinear', align_corners=False)
 
         # 特征融合
-        x = torch.cat(aspp_outs, dim=1)
-        x = self.fusion(x)
-
-        # 最终处理
-        x = self.final_conv(x)
+        aspp_outs.append(global_context)
+        x = self.fusion(torch.cat(aspp_outs, dim=1))
 
         return x
 
-    class TransformerDecoder(DecoderBase):
-        """Transformer解码器"""
 
-        def initialize_layers(self):
-            """初始化层"""
-            self.num_layers = len(self.in_channels)
+class TransformerDecoder(DecoderBase):
+    """Transformer解码器"""
 
-            # 位置编码
-            self.pos_encoder = PositionalEncoding(self.out_channels)
+    def initialize_layers(self) -> None:
+        d_model = self.config.out_channels
 
-            # 解码器层
-            self.layers = nn.ModuleList([
-                TransformerDecoderLayer(
-                    self.out_channels,
-                    nhead=8,
-                    dim_feedforward=2048,
-                    dropout=0.1
-                ) for _ in range(self.num_layers)
-            ])
+        # 特征投影
+        self.input_proj = nn.ModuleList([
+            nn.Conv2d(in_channels, d_model, 1, bias=self.config.use_bias)
+            for in_channels in self.config.in_channels
+        ])
 
-            # 特征投影
-            self.proj = nn.ModuleList([
-                nn.Conv2d(in_channel, self.out_channels, kernel_size=1)
-                for in_channel in self.in_channels
-            ])
+        # Transformer解码器层
+        self.layers = nn.ModuleList([
+            TransformerDecoderLayer(
+                d_model=d_model,
+                nhead=self.config.attention_heads,
+                dim_feedforward=self.config.dim_feedforward,
+                dropout=self.config.dropout,
+                batch_first=True
+            ) for _ in range(len(self.config.in_channels))
+        ])
 
-        def forward(self, features: List[torch.Tensor],
-                    skip_features: Optional[List[torch.Tensor]] = None) -> torch.Tensor:
-            """
-            前向传播
-            Args:
-                features: 编码器特征列表
-                skip_features: 跳跃连接特征列表
-            Returns:
-                解码器特征
-            """
-            B = features[0].shape[0]
+        # 位置编码
+        self.pos_embedding = PositionalEncoding(
+            d_model=d_model,
+            max_len=self.config.max_len,
+            dropout=self.config.dropout,
+            scale=self.config.pos_encoding_scale
+        )
 
-            # 投影特征
-            proj_features = [
-                proj(feat) for proj, feat in zip(self.proj, features)
-            ]
+        # 输出投影
+        self.output_proj = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(self.config.dropout),
+            nn.Linear(d_model * 2, d_model)
+        )
 
-            # 调整形状并添加位置编码
-            memory = []
-            for feat in proj_features:
-                # [B, C, H, W] -> [B, H*W, C]
-                feat = feat.flatten(2).permute(0, 2, 1)
-                feat = self.pos_encoder(feat)
-                memory.append(feat)
+    @torch.cuda.amp.autocast()
+    def forward(self, features: List[torch.Tensor],
+                skip_features: Optional[List[torch.Tensor]] = None) -> torch.Tensor:
+        B = features[0].shape[0]
+        H, W = features[-1].shape[-2:]
 
-            # 初始化查询向量
-            query = torch.zeros(
-                B,
-                memory[0].shape[1],
-                self.out_channels,
-                device=features[0].device
-            )
+        # 特征投影和位置编码
+        memory = []
+        for feat, proj in zip(features, self.input_proj):
+            m = proj(feat).flatten(2).permute(0, 2, 1)  # [B, H*W, C]
+            m = self.pos_embedding(m)
+            memory.append(m)
 
-            # 依次通过解码器层
-            for layer, mem in zip(self.layers, memory):
-                query = layer(query, mem)
+        # 级联解码
+        tgt = torch.zeros_like(memory[0])
+        for layer, mem in zip(self.layers, memory):
+            tgt = layer(tgt, mem)
 
-            # 恢复空间维度
-            H = int(math.sqrt(query.shape[1]))
-            x = query.permute(0, 2, 1).reshape(B, self.out_channels, H, H)
+        # 输出投影
+        out = self.output_proj(tgt)
 
-            return x
+        # 重塑输出
+        return out.permute(0, 2, 1).reshape(B, -1, H, W)
 
-    class PositionalEncoding(nn.Module):
-        """位置编码"""
 
-        def __init__(self, d_model: int, max_len: int = 10000):
-            """
-            初始化位置编码
-            Args:
-                d_model: 特征维度
-                max_len: 最大序列长度
-            """
-            super().__init__()
+class TransformerDecoderLayer(nn.Module):
+    """Transformer解码器层"""
 
-            pe = torch.zeros(max_len, d_model)
-            position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-            div_term = torch.exp(
-                torch.arange(0, d_model, 2).float() *
-                (-math.log(10000.0) / d_model)
-            )
+    def __init__(self, d_model: int, nhead: int,
+                 dim_feedforward: int = 2048,
+                 dropout: float = 0.1,
+                 activation: str = 'relu',
+                 batch_first: bool = True):
+        super().__init__()
+        self.batch_first = batch_first
 
-            pe[:, 0::2] = torch.sin(position * div_term)
-            pe[:, 1::2] = torch.cos(position * div_term)
-            pe = pe.unsqueeze(0)
+        # 自注意力
+        self.self_attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=batch_first
+        )
 
-            self.register_buffer('pe', pe)
+        # 交叉注意力
+        self.cross_attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=batch_first
+        )
+
+        # 前馈网络
+        self.feed_forward = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            self._get_activation_fn(activation),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model)
+        )
+
+        # Layer Normalization
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, query: torch.Tensor,
+                memory: torch.Tensor,
+                query_mask: Optional[torch.Tensor] = None,
+                memory_mask: Optional[torch.Tensor] = None,
+                query_padding_mask: Optional[torch.Tensor] = None,
+                memory_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # 自注意力
+        query2 = self.norm1(query)
+        query = query + self.dropout(
+            self.self_attn(
+                query2, query2, query2,
+                attn_mask=query_mask,
+                key_padding_mask=query_padding_mask
+            )[0]
+        )
+
+        # 交叉注意力
+        query2 = self.norm2(query)
+        query = query + self.dropout(
+            self.cross_attn(
+                query2, memory, memory,
+                attn_mask=memory_mask,
+                key_padding_mask=memory_padding_mask
+            )[0]
+        )
+
+        # 前馈网络
+        query2 = self.norm3(query)
+        query = query + self.dropout(self.feed_forward(query2))
+
+        return query
+
+    @staticmethod
+    def _get_activation_fn(activation: str) -> nn.Module:
+        if activation == "relu":
+            return nn.ReLU()
+        elif activation == "gelu":
+            return nn.GELU()
+        else:
+            raise ValueError(f"Unsupported activation: {activation}")
+
+
+class PositionalEncoding(nn.Module):
+    """位置编码"""
+
+    def __init__(self, d_model: int, max_len: int = 10000,
+                 dropout: float = 0.1, scale: float = 1.0):
+        super().__init__()
+
+        self.dropout = nn.Dropout(p=dropout)
+        self.scale = scale
+
+        pe = self._get_positional_encoding(d_model, max_len)
+        self.register_buffer('pe', pe)
+
+    def _get_positional_encoding(self, d_model: int, max_len: int) -> torch.Tensor:
+        position = torch.arange(max_len).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+
+        pe = torch.zeros(1, max_len, d_model)
+        pe[0, :, 0::2] = torch.sin(position * div_term)
+        pe[0, :, 1::2] = torch.cos(position * div_term)
+
+        return pe
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            """
-            添加位置编码
-            Args:
-                x: 输入特征 [B, L, D]
-            Returns:
-                添加位置编码后的特征
-            """
-            return x + self.pe[:, :x.size(1)]
+            x = x * math.sqrt(self.scale)
+            x = x + self.pe[:, :x.size(1)]
+            return self.dropout(x)
 
-    class TransformerDecoderLayer(nn.Module):
-        """Transformer解码器层"""
+    def create_decoder(decoder_type: str, config: DecoderConfig) -> DecoderBase:
+        """
+        创建解码器
+        Args:
+            decoder_type: 解码器类型 ['fpn', 'unet', 'aspp', 'transformer']
+            config: 解码器配置
+        Returns:
+            解码器实例
+        """
+        decoders: Dict[str, Type[DecoderBase]] = {
+            'fpn': FPNDecoder,
+            'unet': UNetDecoder,
+            'aspp': ASPPDecoder,
+            'transformer': TransformerDecoder
+        }
 
-        def __init__(self, d_model: int, nhead: int,
-                     dim_feedforward: int = 2048, dropout: float = 0.1):
-            """
-            初始化解码器层
-            Args:
-                d_model: 特征维度
-                nhead: 注意力头数
-                dim_feedforward: 前馈网络维度
-                dropout: Dropout率
-            """
-            super().__init__()
+        if decoder_type not in decoders:
+            raise ValueError(f"Unsupported decoder type: {decoder_type}")
 
-            # 自注意力
-            self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-
-            # 交叉注意力
-            self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-
-            # 前馈网络
-            self.feed_forward = nn.Sequential(
-                nn.Linear(d_model, dim_feedforward),
-                nn.ReLU(inplace=True),
-                nn.Dropout(dropout),
-                nn.Linear(dim_feedforward, d_model)
-            )
-
-            # 层归一化
-            self.norm1 = nn.LayerNorm(d_model)
-            self.norm2 = nn.LayerNorm(d_model)
-            self.norm3 = nn.LayerNorm(d_model)
-
-            self.dropout = nn.Dropout(dropout)
-
-        def forward(self, query: torch.Tensor,
-                    memory: torch.Tensor) -> torch.Tensor:
-            """
-            前向传播
-            Args:
-                query: 查询特征 [B, L, D]
-                memory: 记忆特征 [B, L, D]
-            Returns:
-                解码器特征
-            """
-            # 自注意力
-            query2 = self.norm1(query)
-            query = query + self.dropout(
-                self.self_attn(query2, query2, query2)[0]
-            )
-
-            # 交叉注意力
-            query2 = self.norm2(query)
-            query = query + self.dropout(
-                self.cross_attn(query2, memory, memory)[0]
-            )
-
-            # 前馈网络
-            query2 = self.norm3(query)
-            query = query + self.dropout(self.feed_forward(query2))
-
-            return query
-
-    class DecoderFactory:
-        """解码器工厂类"""
-
-        @staticmethod
-        def create(decoder_type: str, **kwargs) -> DecoderBase:
-            """
-            创建解码器实例
-            Args:
-                decoder_type: 解码器类型
-                **kwargs: 其他参数
-            Returns:
-                解码器实例
-            """
-            decoders = {
-                'fpn': FPNDecoder,
-                'unet': UNetDecoder,
-                'aspp': ASPPDecoder,
-                'transformer': TransformerDecoder
-            }
-
-            if decoder_type not in decoders:
-                raise ValueError(f"不支持的解码器类型: {decoder_type}")
-
-            return decoders[decoder_type](**kwargs)
+        return decoders[decoder_type](config)

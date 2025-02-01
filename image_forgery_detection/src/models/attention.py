@@ -2,134 +2,155 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Union, Dict
+from torch import Tensor
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int = 8, dropout: float = 0.1):
+    """优化的多头注意力"""
+
+    def __init__(self, dim: int, num_heads: int = 8, dropout: float = 0.1, bias: bool = True):
         super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError(f"dim {dim} must be divisible by num_heads {num_heads}")
+
         self.num_heads = num_heads
         self.dim = dim
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
 
-        self.q_proj = nn.Linear(dim, dim)
-        self.k_proj = nn.Linear(dim, dim)
-        self.v_proj = nn.Linear(dim, dim)
-        self.out_proj = nn.Linear(dim, dim)
+        # 合并QKV投影
+        self.qkv_proj = nn.Linear(dim, 3 * dim, bias=bias)
+        self.out_proj = nn.Linear(dim, dim, bias=bias)
+
+        nn.init.xavier_uniform_(self.qkv_proj.weight, gain=0.02)
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.02)
+
+        if bias:
+            nn.init.constant_(self.qkv_proj.bias, 0.)
+            nn.init.constant_(self.out_proj.bias, 0.)
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        batch_size = q.shape[0]
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None,
+                cache: Optional[Dict] = None) -> Tuple[Tensor, Tensor]:
+        batch_size, seq_len, _ = x.shape
 
-        # 线性投影
-        q = self.q_proj(q).reshape(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(k).reshape(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(v).reshape(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        # QKV投影
+        qkv = self.qkv_proj(x)
+        qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
-        # 注意力计算
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        # 高效的注意力计算
+        attn_weights = torch.empty(batch_size, self.num_heads, seq_len, seq_len,
+                                   dtype=q.dtype, device=q.device)
+        attn_weights = torch.baddbmm(attn_weights, q, k.transpose(-2, -1),
+                                     beta=0.0, alpha=self.scale)
 
         if mask is not None:
             attn_weights = attn_weights.masked_fill(mask == 0, float('-inf'))
 
-        attn_weights = F.softmax(attn_weights, dim=-1)
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+        attn_weights = attn_weights.type_as(q)
         attn_weights = self.dropout(attn_weights)
 
-        # 加权特征
         out = torch.matmul(attn_weights, v)
-        out = out.transpose(1, 2).reshape(batch_size, -1, self.dim)
+        out = out.transpose(1, 2).reshape(batch_size, seq_len, self.dim)
         out = self.out_proj(out)
 
         return out, attn_weights
 
 
 class SelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int = 8):
-        super().__init__()
-        self.mha = MultiHeadAttention(dim, num_heads)
-        self.norm = nn.LayerNorm(dim)
+    """优化的自注意力"""
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        x_norm = self.norm(x)
-        out, attn = self.mha(x_norm, x_norm, x_norm)
-        return x + out, attn
+    def __init__(self, dim: int, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.mha = MultiHeadAttention(dim, num_heads, dropout)
+        self.norm = nn.LayerNorm(dim)
+        self.gate = nn.Parameter(torch.ones(1))
+
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+        shortcut = x
+        x = self.norm(x)
+        out, attn = self.mha(x, mask=mask)
+        return shortcut + self.gate * out, attn
 
 
 class CrossAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int = 8):
+    """优化的交叉注意力"""
+
+    def __init__(self, dim: int, num_heads: int = 8, dropout: float = 0.1):
         super().__init__()
-        self.mha = MultiHeadAttention(dim, num_heads)
+        self.mha = MultiHeadAttention(dim, num_heads, dropout)
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
+        self.gate = nn.Parameter(torch.ones(1))
 
-    def forward(self, x: torch.Tensor, context: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        x_norm = self.norm1(x)
-        context_norm = self.norm2(context)
-        out, attn = self.mha(x_norm, context_norm, context_norm)
-        return x + out, attn
+    def forward(self, x: Tensor, context: Tensor,
+                mask: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+        shortcut = x
+        x = self.norm1(x)
+        context = self.norm2(context)
+        out, attn = self.mha(x, mask=mask)
+        return shortcut + self.gate * out, attn
 
 
 class CBAM(nn.Module):
-    def __init__(self, channels: int, reduction: int = 16):
+    """优化的CBAM注意力"""
+
+    def __init__(self, channels: int, reduction: int = 16, kernel_size: int = 7):
         super().__init__()
-        self.channel_attention = ChannelAttention(channels, reduction)
-        self.spatial_attention = SpatialAttention()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.channel_attention(x)
-        x = self.spatial_attention(x)
-        return x
-
-
-class ChannelAttention(nn.Module):
-    def __init__(self, channels: int, reduction: int = 16):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-
-        self.mlp = nn.Sequential(
-            nn.Linear(channels, channels // reduction, bias=False),
+        # 通道注意力
+        self.channel_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // reduction, 1),
+            nn.BatchNorm2d(channels // reduction),
             nn.ReLU(inplace=True),
-            nn.Linear(channels // reduction, channels, bias=False)
+            nn.Conv2d(channels // reduction, channels, 1),
+            nn.BatchNorm2d(channels),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, _, _ = x.shape
+        # 空间注意力 - 使用深度可分离卷积
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, groups=1),
+            nn.BatchNorm2d(1),
+        )
 
-        # 平均池化
-        avg_out = self.mlp(self.avg_pool(x).view(b, c))
-        # 最大池化
-        max_out = self.mlp(self.max_pool(x).view(b, c))
+        self._init_weights()
 
-        # 注意力加权
-        attention = torch.sigmoid(avg_out + max_out).view(b, c, 1, 1)
-        return x * attention
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
+    def forward(self, x: Tensor) -> Tensor:
+        # 通道注意力
+        channel_attn = torch.sigmoid(self.channel_gate(x))
+        x = x * channel_attn
 
-class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size: int = 7):
-        super().__init__()
-        padding = kernel_size // 2
-        self.conv = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        # 空间注意力
+        spatial = torch.cat([
+            torch.mean(x, dim=1, keepdim=True),
+            torch.max(x, dim=1, keepdim=True)[0]
+        ], dim=1)
+        spatial_attn = torch.sigmoid(self.spatial_gate(spatial))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 计算空间注意力
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        attention = torch.cat([avg_out, max_out], dim=1)
-        attention = torch.sigmoid(self.conv(attention))
-
-        return x * attention
+        return x * spatial_attn
 
 
 class PyramidAttention(nn.Module):
-    def __init__(self, channels: int, scales: list = [1, 0.5, 0.25]):
+    """优化的金字塔注意力"""
+
+    def __init__(self, channels: int, scales: List[float] = [1, 0.5, 0.25]):
         super().__init__()
         self.scales = scales
-        self.attention_blocks = nn.ModuleList([
+        self.attentions = nn.ModuleList([
             SelfAttention(channels) for _ in scales
         ])
 
@@ -139,135 +160,169 @@ class PyramidAttention(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        attentions = []
+        self.size_cache = {}
 
-        for scale, attn in zip(self.scales, self.attention_blocks):
-            # 缩放输入
+    def _get_size(self, size: Tuple[int, int], scale: float) -> Tuple[int, int]:
+        cache_key = (size, scale)
+        if cache_key not in self.size_cache:
+            h = int(size[0] * scale)
+            w = int(size[1] * scale)
+            self.size_cache[cache_key] = (h, w)
+        return self.size_cache[cache_key]
+
+    @torch.cuda.amp.autocast()
+    def forward(self, x: Tensor) -> Tensor:
+        results = []
+        size = (x.shape[2], x.shape[3])
+
+        for scale, attn in zip(self.scales, self.attentions):
             if scale != 1:
-                h = int(x.shape[2] * scale)
-                w = int(x.shape[3] * scale)
-                scaled = F.interpolate(x, size=(h, w), mode='bilinear', align_corners=True)
+                scaled_size = self._get_size(size, scale)
+                scaled = F.interpolate(x, size=scaled_size, mode='bilinear',
+                                       align_corners=False)
             else:
                 scaled = x
 
-            # 重塑为序列
             b, c, h, w = scaled.shape
-            scaled = scaled.reshape(b, c, -1).transpose(-2, -1)
+            feat = scaled.reshape(b, c, -1).transpose(-2, -1)
+            feat, _ = attn(feat)
+            feat = feat.transpose(-2, -1).reshape(b, c, h, w)
 
-            # 应用注意力
-            attended, _ = attn(scaled)
-
-            # 恢复空间维度
-            attended = attended.transpose(-2, -1).reshape(b, c, h, w)
-
-            # 上采样回原始尺寸
             if scale != 1:
-                attended = F.interpolate(
-                    attended,
-                    size=(x.shape[2], x.shape[3]),
-                    mode='bilinear',
-                    align_corners=True
-                )
+                feat = F.interpolate(feat, size=size, mode='bilinear',
+                                     align_corners=False)
 
-            attentions.append(attended)
+            results.append(feat)
 
-        # 特征融合
-        out = torch.cat(attentions, dim=1)
+        out = torch.cat(results, dim=1)
         out = self.fusion(out)
 
         return out
 
 
 class DeformableAttention(nn.Module):
+    """优化的可变形注意力"""
+
     def __init__(self, channels: int, num_heads: int = 8, num_points: int = 4):
         super().__init__()
         self.num_heads = num_heads
         self.num_points = num_points
         self.channels = channels
 
-        # 偏移预测
-        self.offset_conv = nn.Conv2d(channels, num_heads * num_points * 2, 1)
-
-        # 注意力权重
-        self.attention_conv = nn.Conv2d(channels, num_heads * num_points, 1)
-
-        # 特征变换
-        self.value_conv = nn.Conv2d(channels, channels, 1)
-        self.output_conv = nn.Conv2d(channels, channels, 1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size = x.shape[0]
-
-        # 预测采样点偏移
-        offsets = self.offset_conv(x)
-        offsets = offsets.reshape(
-            batch_size, self.num_heads, self.num_points, 2,
-            x.shape[2], x.shape[3]
+        self.offset_conv = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, groups=channels),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, num_heads * num_points * 2, 1)
         )
 
-        # 注意力权重
-        attention = self.attention_conv(x)
-        attention = attention.reshape(
-            batch_size, self.num_heads, self.num_points,
-            x.shape[2], x.shape[3]
+        self.attention_conv = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, groups=channels),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, num_heads * num_points, 1)
         )
-        attention = torch.sigmoid(attention)
 
-        # 变换特征
-        value = self.value_conv(x)
+        self.value_proj = nn.Conv2d(channels, channels, 1)
+        self.output_proj = nn.Conv2d(channels, channels, 1)
 
-        # 双线性插值采样
-        out = self._deformable_sampling(value, offsets, attention)
-        out = self.output_conv(out)
+        self._reset_parameters()
 
-        return out + x
+    def _reset_parameters(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
 
-    def _deformable_sampling(self, x: torch.Tensor,
-                             offsets: torch.Tensor,
-                             attention: torch.Tensor) -> torch.Tensor:
-        batch_size, channels = x.shape[:2]
-        height, width = x.shape[2:]
-
-        # 生成参考点
+    def _get_offset_reference(self, spatial_shapes: Tuple[int, int],
+                              device: torch.device) -> Tensor:
+        """获取参考点坐标"""
+        h, w = spatial_shapes
         ref_y, ref_x = torch.meshgrid(
-            torch.arange(height, device=x.device),
-            torch.arange(width, device=x.device)
+            torch.linspace(0.5, h - 0.5, h, device=device),
+            torch.linspace(0.5, w - 0.5, w, device=device)
         )
         ref = torch.stack((ref_x, ref_y), -1)
-        ref = ref.reshape(1, 1, 1, 2, height, width)
+        ref[..., 0] = ref[..., 0] / max(w - 1, 1)
+        ref[..., 1] = ref[..., 1] / max(h - 1, 1)
+        ref = ref * 2 - 1
+        return ref
+
+    def forward(self, x: Tensor) -> Tensor:
+        identity = x
+        b, c, h, w = x.shape
+
+        # 计算采样偏移
+        offset = self.offset_conv(x)
+        offset = offset.view(b, self.num_heads, self.num_points, 2, h, w)
+
+        # 计算注意力权重
+        attention = self.attention_conv(x)
+        attention = attention.view(b, self.num_heads, self.num_points, h, w)
+        attention = torch.sigmoid(attention)
+
+        # 特征变换
+        value = self.value_proj(x)
+
+        # 获取参考点
+        reference = self._get_offset_reference((h, w), x.device)
 
         # 采样坐标
-        sampling_locations = ref + offsets
-        sampling_locations = sampling_locations.reshape(
-            batch_size, self.num_heads * self.num_points, 2, height, width
+        if self.num_points > 1:
+            reference = reference.repeat(1, 1, self.num_points, 1)
+            offset = offset.reshape(b, self.num_heads * self.num_points, 2, h, w)
+
+        sampling_locations = reference + offset
+        sampling_locations = sampling_locations.reshape(b, -1, h, w, 2)
+
+        # 双线性采样
+        value = value.reshape(b, self.num_heads, -1, h, w)
+        output = F.grid_sample(
+            value, sampling_locations,
+            mode='bilinear', padding_mode='zeros', align_corners=True
         )
 
-        # 归一化坐标
-        sampling_locations[..., 0, :, :] /= (width - 1)
-        sampling_locations[..., 1, :, :] /= (height - 1)
-        sampling_locations = sampling_locations * 2 - 1
+        # 注意力加权
+        attention = attention.reshape(b, self.num_heads, -1, 1, h, w)
+        output = (output * attention).sum(dim=2)
 
-        # 重塑特征和注意力权重
-        x = x.reshape(batch_size, channels, height * width)
-        sampling_locations = sampling_locations.reshape(
-            batch_size, self.num_heads * self.num_points, 2, height * width
-        )
-        attention = attention.reshape(
-            batch_size, self.num_heads * self.num_points, height * width
-        )
+        output = output.reshape(b, c, h, w)
+        output = self.output_proj(output)
 
-        # 双线性插值采样
-        sampled_features = F.grid_sample(
-            x.reshape(batch_size, channels, height, width),
-            sampling_locations.permute(0, 2, 1, 3).reshape(
-                batch_size, 2, height, width
-            ),
-            mode='bilinear',
-            padding_mode='zeros',
-            align_corners=True
-        )
+        return output + identity
 
-        # 加权求和
-        output = (sampled_features * attention.unsqueeze(1)).sum(dim=2)
-        return output.reshape(batch_size, channels, height, width)
+
+def create_attention_mask(seq_len: int, device: torch.device,
+                          is_causal: bool = False) -> Tensor:
+    """创建注意力掩码"""
+    mask = torch.ones(seq_len, seq_len, device=device)
+    if is_causal:
+        mask = torch.triu(mask, diagonal=1)
+    return mask
+
+
+def relative_position_bucket(relative_position: Tensor,
+                             num_buckets: int = 32,
+                             max_distance: int = 128) -> Tensor:
+    """计算相对位置编码的bucket"""
+    ret = 0
+    n = -relative_position
+    n = torch.max(n, torch.zeros_like(n))
+
+    max_exact = num_buckets // 2
+    is_small = n < max_exact
+
+    val_if_large = max_exact + (
+            torch.log(n.float() / max_exact)
+            / math.log(max_distance / max_exact)
+            * (num_buckets - max_exact)
+    ).long()
+    val_if_large = torch.min(val_if_large,
+                             torch.full_like(val_if_large, num_buckets - 1))
+
+    ret += torch.where(is_small, n, val_if_large)
+    return ret

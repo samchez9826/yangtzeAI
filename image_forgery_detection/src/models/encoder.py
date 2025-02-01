@@ -1,378 +1,253 @@
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
-import timm
-from typing import Dict, List, Optional, Tuple, Union
-import logging
+import torch.nn.functional as F
+from typing import Dict, List, Tuple, Optional, Union
+import numpy as np
+from dataclasses import dataclass
+from abc import ABC, abstractmethod
 
 
-class EncoderBase(nn.Module):
-    """编码器基类"""
+@dataclass
+class LossConfig:
+    """损失函数配置"""
+    name: str  # 损失函数名称
+    alpha: float = 0.25  # Focal Loss的alpha参数
+    gamma: float = 2.0  # Focal Loss的gamma参数
+    smooth: float = 1.0  # Dice Loss的平滑参数
+    eps: float = 1e-7  # 数值稳定性参数
+    temperature: float = 0.5  # 温度参数
+    edge_width: int = 3  # 边缘宽度
+    weights: Optional[Dict[str, float]] = None  # 多任务损失的权重
 
-    def __init__(self, name: str, pretrained: bool = True,
-                 features_only: bool = True):
-        """
-        初始化编码器
-        Args:
-            name: 编码器名称
-            pretrained: 是否使用预训练权重
-            features_only: 是否只返回特征
-        """
+
+class LossBase(nn.Module, ABC):
+    """损失函数基类"""
+
+    def __init__(self):
         super().__init__()
-        self.name = name
-        self.features_only = features_only
 
-        # 加载预训练模型
-        self.model = timm.create_model(
-            name,
-            pretrained=pretrained,
-            features_only=features_only
-        )
-
-        # 获取特征维度
-        self.feature_info = self.model.feature_info
-
-    def forward(self, x: torch.Tensor) -> Union[torch.Tensor, List[torch.Tensor]]:
+    @abstractmethod
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """前向传播"""
-        return self.model(x)
+        raise NotImplementedError
 
 
-class PyramidEncoder(EncoderBase):
-    """金字塔特征编码器"""
+class FocalLoss(LossBase):
+    """Focal Loss"""
 
-    def __init__(self, name: str, pretrained: bool = True,
-                 features_only: bool = True, out_indices: Tuple = (1, 2, 3, 4)):
-        """
-        初始化金字塔编码器
-        Args:
-            name: 编码器名称
-            pretrained: 是否使用预训练权重
-            features_only: 是否只返回特征
-            out_indices: 输出特征的层索引
-        """
-        super().__init__(name, pretrained, features_only)
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0,
+                 reduction: str = 'mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
 
-        # 设置输出层
-        self.model.out_indices = out_indices
+    @torch.cuda.amp.autocast()
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """计算Focal Loss"""
+        # 处理输入维度
+        if inputs.dim() > 2:
+            inputs = inputs.view(inputs.size(0), inputs.size(1), -1)  # [N, C, HW]
+            inputs = inputs.transpose(1, 2)  # [N, HW, C]
+            inputs = inputs.contiguous().view(-1, inputs.size(2))  # [NHW, C]
 
-        # 获取每层特征维度
-        self.channels = [
-            self.feature_info.channels()[i]
-            for i in range(len(out_indices))
-        ]
+        targets = targets.view(-1, 1)
 
-    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
-        """
-        前向传播
-        Args:
-            x: 输入张量
-        Returns:
-            多尺度特征列表
-        """
-        return self.model(x)
+        # 计算log概率
+        logpt = F.log_softmax(inputs, dim=1)
+        logpt = logpt.gather(1, targets)
+        logpt = logpt.view(-1)
+        pt = logpt.exp()
+
+        # 计算focal loss
+        loss = -self.alpha * (1 - pt) ** self.gamma * logpt
+
+        # 降维
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        return loss
 
 
-class MultiScaleEncoder(EncoderBase):
-    """多尺度特征编码器"""
+class DiceLoss(LossBase):
+    """Dice Loss"""
 
-    def __init__(self, name: str, pretrained: bool = True,
-                 scales: List[float] = [1.0, 0.75, 0.5]):
-        """
-        初始化多尺度编码器
-        Args:
-            name: 编码器名称
-            pretrained: 是否使用预训练权重
-            scales: 特征尺度列表
-        """
-        super().__init__(name, pretrained, features_only=True)
-        self.scales = scales
+    def __init__(self, smooth: float = 1.0, eps: float = 1e-7):
+        super().__init__()
+        self.smooth = smooth
+        self.eps = eps
 
-        # 特征融合层
-        in_channels = self.feature_info.channels()[-1]
-        self.fusion = nn.Sequential(
-            nn.Conv2d(in_channels * len(scales), in_channels,
-                      kernel_size=1, bias=False),
-            nn.BatchNorm2d(in_channels),
-            nn.ReLU(inplace=True)
+    @torch.cuda.amp.autocast()
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """计算Dice Loss"""
+        num_classes = inputs.size(1)
+
+        if num_classes == 1:
+            return self._binary_dice_loss(torch.sigmoid(inputs), targets)
+
+        # 多类别
+        dice = 0.
+        for i in range(num_classes):
+            dice += self._binary_dice_loss(inputs[:, i, ...], targets == i)
+
+        return dice / num_classes
+
+    def _binary_dice_loss(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """计算二分类的Dice Loss"""
+        inputs = inputs.contiguous().view(-1)
+        targets = targets.contiguous().view(-1)
+
+        intersection = (inputs * targets).sum()
+        union = inputs.sum() + targets.sum()
+
+        dice = (2. * intersection + self.smooth) / (union + self.smooth + self.eps)
+        return 1. - dice
+
+
+class EdgeConsistencyLoss(LossBase):
+    """边缘一致性损失"""
+
+    def __init__(self, edge_width: int = 3):
+        super().__init__()
+        self.edge_width = edge_width
+        self.register_buffer('sobel_x', torch.FloatTensor([
+            [-1, 0, 1],
+            [-2, 0, 2],
+            [-1, 0, 1]
+        ]).view(1, 1, 3, 3))
+        self.register_buffer('sobel_y', torch.FloatTensor([
+            [-1, -2, -1],
+            [0, 0, 0],
+            [1, 2, 1]
+        ]).view(1, 1, 3, 3))
+
+    @torch.cuda.amp.autocast()
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """计算边缘一致性损失"""
+        # 计算梯度
+        pred_grad_x = F.conv2d(inputs, self.sobel_x, padding=1)
+        pred_grad_y = F.conv2d(inputs, self.sobel_y, padding=1)
+        target_grad_x = F.conv2d(targets, self.sobel_x, padding=1)
+        target_grad_y = F.conv2d(targets, self.sobel_y, padding=1)
+
+        # 计算边缘强度
+        pred_edge = torch.sqrt(pred_grad_x.pow(2) + pred_grad_y.pow(2))
+        target_edge = torch.sqrt(target_grad_x.pow(2) + target_grad_y.pow(2))
+
+        # 扩展边缘区域
+        target_edge = F.max_pool2d(
+            target_edge,
+            kernel_size=self.edge_width,
+            stride=1,
+            padding=self.edge_width // 2
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        前向传播
-        Args:
-            x: 输入张量
-        Returns:
-            融合后的特征
-        """
-        features = []
-
-        # 多尺度特征提取
-        for scale in self.scales:
-            if scale != 1.0:
-                size = (int(x.shape[2] * scale), int(x.shape[3] * scale))
-                scaled = nn.functional.interpolate(
-                    x, size=size, mode='bilinear', align_corners=True
-                )
-            else:
-                scaled = x
-
-            feat = self.model(scaled)[-1]  # 取最后一层特征
-
-            # 调整特征大小
-            if scale != 1.0:
-                feat = nn.functional.interpolate(
-                    feat,
-                    size=(x.shape[2] // 32, x.shape[3] // 32),  # 假设下采样率为32
-                    mode='bilinear',
-                    align_corners=True
-                )
-
-            features.append(feat)
-
-        # 特征融合
-        multi_scale_features = torch.cat(features, dim=1)
-        fused_features = self.fusion(multi_scale_features)
-
-        return fused_features
+        # 计算边缘区域的损失
+        return F.mse_loss(pred_edge * target_edge, target_edge)
 
 
-class AttentionEncoder(EncoderBase):
-    """带注意力机制的编码器"""
+class ConsistencyLoss(LossBase):
+    """特征一致性损失"""
 
-    def __init__(self, name: str, pretrained: bool = True,
-                 attention_type: str = 'self'):
-        """
-        初始化注意力编码器
-        Args:
-            name: 编码器名称
-            pretrained: 是否使用预训练权重
-            attention_type: 注意力类型 ['self', 'cbam']
-        """
-        super().__init__(name, pretrained, features_only=True)
+    def __init__(self, temperature: float = 0.5):
+        super().__init__()
+        self.temperature = temperature
 
-        in_channels = self.feature_info.channels()[-1]
+    @torch.cuda.amp.autocast()
+    def forward(self, features1: torch.Tensor, features2: torch.Tensor) -> torch.Tensor:
+        """计算特征一致性损失"""
+        # 归一化特征
+        features1 = F.normalize(features1, dim=1)
+        features2 = F.normalize(features2, dim=1)
 
-        # 选择注意力机制
-        if attention_type == 'self':
-            self.attention = SelfAttention(in_channels)
-        elif attention_type == 'cbam':
-            self.attention = CBAM(in_channels)
-        else:
-            raise ValueError(f"不支持的注意力类型: {attention_type}")
+        # 计算相似度矩阵
+        batch_size = features1.size(0)
+        features1_flat = features1.view(batch_size, -1)
+        features2_flat = features2.view(batch_size, -1)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        前向传播
-        Args:
-            x: 输入张量
-        Returns:
-            特征和注意力图
-        """
-        features = self.model(x)[-1]  # 取最后一层特征
-        features, attention_map = self.attention(features)
-        return features, attention_map
+        similarity = torch.matmul(features1_flat, features2_flat.t()) / self.temperature
+        labels = torch.arange(batch_size, device=similarity.device)
 
-    class DilatedEncoder(EncoderBase):
-        """空洞卷积编码器"""
+        return F.cross_entropy(similarity, labels)
 
-        def __init__(self, name: str, pretrained: bool = True,
-                     dilations: List[int] = [6, 12, 18]):
-            """
-            初始化空洞卷积编码器
-            Args:
-                name: 编码器名称
-                pretrained: 是否使用预训练权重
-                dilations: 空洞率列表
-            """
-            super().__init__(name, pretrained, features_only=True)
 
-            in_channels = self.feature_info.channels()[-1]
+class MultiTaskLoss(nn.Module):
+    """多任务损失"""
 
-            # 空洞卷积分支
-            self.aspp_branches = nn.ModuleList([
-                nn.Sequential(
-                    nn.Conv2d(in_channels, in_channels, 3,
-                              padding=dilation, dilation=dilation, bias=False),
-                    nn.BatchNorm2d(in_channels),
-                    nn.ReLU(inplace=True)
-                ) for dilation in dilations
-            ])
+    def __init__(self, tasks: Dict[str, LossBase],
+                 weights: Optional[Dict[str, float]] = None):
+        super().__init__()
+        self.tasks = nn.ModuleDict(tasks)
+        self.weights = weights or {task: 1.0 for task in tasks.keys()}
 
-            # 1x1卷积分支
-            self.aspp_branches.append(nn.Sequential(
-                nn.Conv2d(in_channels, in_channels, 1, bias=False),
-                nn.BatchNorm2d(in_channels),
-                nn.ReLU(inplace=True)
-            ))
+    @torch.cuda.amp.autocast()
+    def forward(self, inputs: Dict[str, torch.Tensor],
+                targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """计算多任务损失"""
+        losses = {}
+        total_loss = 0.
 
-            # 全局上下文分支
-            self.global_branch = nn.Sequential(
-                nn.AdaptiveAvgPool2d(1),
-                nn.Conv2d(in_channels, in_channels, 1, bias=False),
-                nn.BatchNorm2d(in_channels),
-                nn.ReLU(inplace=True)
-            )
+        # 计算每个任务的损失
+        for task_name, criterion in self.tasks.items():
+            if task_name in inputs and task_name in targets:
+                try:
+                    loss = criterion(inputs[task_name], targets[task_name])
+                    weighted_loss = self.weights[task_name] * loss
+                    losses[task_name] = loss
+                    total_loss += weighted_loss
+                except Exception as e:
+                    print(f"Error computing loss for task {task_name}: {e}")
+                    continue
 
-            # 特征融合
-            total_channels = in_channels * (len(dilations) + 2)
-            self.fusion = nn.Sequential(
-                nn.Conv2d(total_channels, in_channels, 1, bias=False),
-                nn.BatchNorm2d(in_channels),
-                nn.ReLU(inplace=True),
-                nn.Dropout(0.5)
-            )
+        losses['total'] = total_loss
+        return losses
 
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            """
-            前向传播
-            Args:
-                x: 输入张量
-            Returns:
-                融合后的特征
-            """
-            features = self.model(x)[-1]  # 取最后一层特征
 
-            # ASPP分支
-            aspp_outputs = []
-            for branch in self.aspp_branches:
-                aspp_outputs.append(branch(features))
+def create_criterion(config: LossConfig) -> Dict[str, nn.Module]:
+    """
+    创建损失函数
+    Args:
+        config: 损失函数配置
+    Returns:
+        损失函数字典
+    """
+    criterion = {}
 
-            # 全局上下文分支
-            global_context = self.global_branch(features)
-            global_context = nn.functional.interpolate(
-                global_context,
-                size=features.shape[2:],
-                mode='bilinear',
-                align_corners=True
-            )
-            aspp_outputs.append(global_context)
+    # 分类损失
+    if config.name == 'focal':
+        criterion['cls'] = FocalLoss(
+            alpha=config.alpha,
+            gamma=config.gamma
+        )
+    elif config.name == 'cross_entropy':
+        criterion['cls'] = nn.CrossEntropyLoss()
 
-            # 特征融合
-            concat_features = torch.cat(aspp_outputs, dim=1)
-            fused_features = self.fusion(concat_features)
+    # 分割损失
+    if config.name == 'dice':
+        criterion['seg'] = DiceLoss(
+            smooth=config.smooth,
+            eps=config.eps
+        )
+    elif config.name == 'bce':
+        criterion['seg'] = nn.BCEWithLogitsLoss()
 
-            return fused_features
+    # 边缘一致性损失
+    if config.name == 'edge':
+        criterion['edge'] = EdgeConsistencyLoss(
+            edge_width=config.edge_width
+        )
 
-    class SelfAttention(nn.Module):
-        """自注意力模块"""
+    # 特征一致性损失
+    if config.name == 'consistency':
+        criterion['consistency'] = ConsistencyLoss(
+            temperature=config.temperature
+        )
 
-        def __init__(self, in_channels: int, heads: int = 8):
-            """
-            初始化自注意力模块
-            Args:
-                in_channels: 输入通道数
-                heads: 注意力头数
-            """
-            super().__init__()
-            self.heads = heads
-            self.scale = (in_channels // heads) ** -0.5
+    # 如果有多个任务且指定了权重
+    if len(criterion) > 1 and config.weights:
+        return MultiTaskLoss(criterion, config.weights)
 
-            self.query = nn.Conv2d(in_channels, in_channels, 1)
-            self.key = nn.Conv2d(in_channels, in_channels, 1)
-            self.value = nn.Conv2d(in_channels, in_channels, 1)
-
-            self.proj = nn.Conv2d(in_channels, in_channels, 1)
-
-        def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-            """
-            前向传播
-            Args:
-                x: 输入特征 [B, C, H, W]
-            Returns:
-                注意力特征和注意力图
-            """
-            B, C, H, W = x.shape
-
-            # 生成Q、K、V
-            q = self.query(x).view(B, self.heads, C // self.heads, -1)
-            k = self.key(x).view(B, self.heads, C // self.heads, -1)
-            v = self.value(x).view(B, self.heads, C // self.heads, -1)
-
-            # 计算注意力
-            attn = torch.matmul(q.transpose(-2, -1), k) * self.scale
-            attn = attn.softmax(dim=-1)
-
-            # 应用注意力
-            out = torch.matmul(attn, v.transpose(-2, -1))
-            out = out.view(B, C, H, W)
-
-            # 投影
-            out = self.proj(out)
-
-            return out, attn.mean(dim=1)  # 返回特征和注意力图
-
-    class CBAM(nn.Module):
-        """CBAM注意力模块"""
-
-        def __init__(self, in_channels: int, reduction: int = 16):
-            """
-            初始化CBAM模块
-            Args:
-                in_channels: 输入通道数
-                reduction: 通道降维比例
-            """
-            super().__init__()
-
-            # 通道注意力
-            self.channel_avg_pool = nn.AdaptiveAvgPool2d(1)
-            self.channel_max_pool = nn.AdaptiveMaxPool2d(1)
-
-            self.channel_mlp = nn.Sequential(
-                nn.Conv2d(in_channels, in_channels // reduction, 1),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(in_channels // reduction, in_channels, 1)
-            )
-
-            # 空间注意力
-            self.spatial_conv = nn.Conv2d(2, 1, kernel_size=7, padding=3)
-
-        def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-            """
-            前向传播
-            Args:
-                x: 输入特征
-            Returns:
-                注意力特征和注意力图
-            """
-            # 通道注意力
-            avg_out = self.channel_mlp(self.channel_avg_pool(x))
-            max_out = self.channel_mlp(self.channel_max_pool(x))
-            channel_attn = torch.sigmoid(avg_out + max_out)
-
-            x = x * channel_attn
-
-            # 空间注意力
-            avg_out = torch.mean(x, dim=1, keepdim=True)
-            max_out, _ = torch.max(x, dim=1, keepdim=True)
-            spatial_feat = torch.cat([avg_out, max_out], dim=1)
-            spatial_attn = torch.sigmoid(self.spatial_conv(spatial_feat))
-
-            out = x * spatial_attn
-
-            # 返回特征和组合注意力图
-            attn = channel_attn * spatial_attn
-            return out, attn
-
-    class EncoderFactory:
-        """编码器工厂类"""
-
-        @staticmethod
-        def create(encoder_type: str, **kwargs) -> EncoderBase:
-            """
-            创建编码器实例
-            Args:
-                encoder_type: 编码器类型
-                **kwargs: 其他参数
-            Returns:
-                编码器实例
-            """
-            encoders = {
-                'pyramid': PyramidEncoder,
-                'multiscale': MultiScaleEncoder,
-                'attention': AttentionEncoder,
-                'dilated': DilatedEncoder
-            }
-
-            if encoder_type not in encoders:
-                raise ValueError(f"不支持的编码器类型: {encoder_type}")
-
-            return encoders[encoder_type](**kwargs)
+    return criterion
