@@ -400,3 +400,278 @@ class CosineAnnealingLR(LRSchedulerBase):
         super().load_state_dict(state_dict)
 
 
+class CyclicLRScheduler(LRSchedulerBase):
+    """高效的循环学习率调度器
+
+    特点:
+    - 支持多种循环模式
+    - 动态动量调整
+    - 内存高效的缓存策略
+    - 支持自定义缩放函数
+    """
+
+    def __init__(self,
+                 optimizer: Optimizer,
+                 base_lr: float,
+                 max_lr: float,
+                 step_size: int,
+                 mode: str = 'triangular',
+                 gamma: float = 1.0,
+                 scale_mode: str = 'cycle',
+                 cycle_momentum: bool = True,
+                 base_momentum: float = 0.8,
+                 max_momentum: float = 0.9,
+                 last_epoch: int = -1,
+                 verbose: bool = False):
+        """
+        Args:
+            optimizer: 优化器实例
+            base_lr: 基础学习率
+            max_lr: 最大学习率
+            step_size: 步长(半个周期的步数)
+            mode: 学习率变化模式 ['triangular', 'triangular2', 'exp_range']
+            gamma: exp_range模式的衰减率
+            scale_mode: 缩放模式 ['cycle', 'iterations']
+            cycle_momentum: 是否调整动量
+            base_momentum: 基础动量
+            max_momentum: 最大动量
+            last_epoch: 上一个epoch索引
+            verbose: 是否打印学习率变化
+        """
+        self.base_lr = base_lr
+        self.max_lr = max_lr
+        self.step_size = step_size
+        self.mode = mode
+        self.gamma = gamma
+        self.scale_mode = scale_mode
+        self.cycle_momentum = cycle_momentum
+
+        if cycle_momentum:
+            self.base_momentum = base_momentum
+            self.max_momentum = max_momentum
+
+        # 验证参数
+        self._validate_params()
+
+        # 预计算常量
+        self._step_ratio = float(step_size)
+        self._lr_diff = float(max_lr - base_lr)
+
+        if cycle_momentum:
+            self._momentum_diff = max_momentum - base_momentum
+
+        # 初始化缓存
+        self._last_scale_mode_cycle = 0
+        self._scale_fn = self._get_scale_fn()
+
+        super().__init__(optimizer, last_epoch, verbose=verbose)
+
+    def _validate_params(self) -> None:
+        """验证参数有效性"""
+        if self.mode not in ['triangular', 'triangular2', 'exp_range']:
+            raise ValueError(f"mode must be one of ['triangular', 'triangular2', 'exp_range'], got {self.mode}")
+        if self.scale_mode not in ['cycle', 'iterations']:
+            raise ValueError(f"scale_mode must be one of ['cycle', 'iterations'], got {self.scale_mode}")
+        if self.base_lr >= self.max_lr:
+            raise ValueError(f"base_lr must be less than max_lr, got {self.base_lr} >= {self.max_lr}")
+        if self.step_size <= 0:
+            raise ValueError(f"step_size must be positive, got {self.step_size}")
+
+    def _get_scale_fn(self) -> Callable[[int], float]:
+        """获取缩放函数"""
+        if self.mode == 'triangular':
+            return lambda _: 1.0
+        elif self.mode == 'triangular2':
+            return lambda cycle: 1.0 / (2.0 ** cycle)
+        elif self.mode == 'exp_range':
+            return lambda cycle: self.gamma ** cycle
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
+
+    @torch.no_grad()
+    def get_lr(self) -> List[float]:
+        """计算当前学习率"""
+        if not self._get_lr_called_within_step:
+            logger.warning("To get the last learning rate computed by the scheduler, "
+                           "please use `get_last_lr()`.")
+
+        # 计算周期和位置
+        cycle = math.floor(1 + self.last_epoch / (2 * self.step_size))
+        x = abs(self.last_epoch / self.step_size - 2 * cycle + 1)
+
+        # 计算缩放因子
+        scale_factor = self._scale_fn(cycle if self.scale_mode == 'cycle' else self.last_epoch)
+
+        # 计算学习率
+        lrs = []
+        for base_lr in self.base_lrs:
+            lr = base_lr + (self.max_lr - base_lr) * max(0, (1 - x)) * scale_factor
+            lrs.append(self._clip_lr(lr))
+
+        # 调整动量
+        if self.cycle_momentum:
+            self._adjust_momentum(x)
+
+        return lrs
+
+    def _adjust_momentum(self, x: float) -> None:
+        """调整动量参数
+
+        动量与学习率反向变化,学习率高时动量低
+        """
+        if not hasattr(self.optimizer, 'momentum'):
+            return
+
+        momentum = self.max_momentum - self._momentum_diff * max(0, (1 - x))
+        for param_group in self.optimizer.param_groups:
+            if 'momentum' in param_group:
+                param_group['momentum'] = momentum
+
+
+class OneCycleLRScheduler(LRSchedulerBase):
+    """高效的 One Cycle 学习率调度器
+
+    特点:
+    - 三阶段学习率调整
+    - 动态动量调整
+    - 支持多种退火策略
+    - 内存高效实现
+    """
+
+    def __init__(self,
+                 optimizer: Optimizer,
+                 max_lr: float,
+                 total_steps: int,
+                 pct_start: float = 0.3,
+                 anneal_strategy: str = 'cos',
+                 cycle_momentum: bool = True,
+                 base_momentum: float = 0.85,
+                 max_momentum: float = 0.95,
+                 div_factor: float = 25.0,
+                 final_div_factor: float = 1e4,
+                 last_epoch: int = -1,
+                 verbose: bool = False):
+        """
+        Args:
+            optimizer: 优化器实例
+            max_lr: 最大学习率
+            total_steps: 总步数
+            pct_start: 上升阶段占比
+            anneal_strategy: 退火策略 ['cos', 'linear']
+            cycle_momentum: 是否调整动量
+            base_momentum: 基础动量
+            max_momentum: 最大动量
+            div_factor: 初始学习率除数
+            final_div_factor: 最终学习率除数
+            last_epoch: 上一个epoch索引
+            verbose: 是否打印学习率变化
+        """
+        self.max_lr = max_lr
+        self.total_steps = total_steps
+        self.pct_start = pct_start
+        self.anneal_strategy = anneal_strategy
+        self.cycle_momentum = cycle_momentum
+        self.base_momentum = base_momentum
+        self.max_momentum = max_momentum
+        self.div_factor = div_factor
+        self.final_div_factor = final_div_factor
+
+        # 验证参数
+        self._validate_params()
+
+        # 计算阶段步数
+        self._step_size_up = float(pct_start * total_steps) - 1
+        self._step_size_down = float(total_steps - self._step_size_up) - 1
+
+        # 预计算常量
+        self._init_lr = float(max_lr) / self.div_factor
+        self._final_lr = self._init_lr / self.final_div_factor
+
+        if cycle_momentum:
+            self._momentum_diff = max_momentum - base_momentum
+
+        super().__init__(optimizer, last_epoch, verbose=verbose)
+
+    def _validate_params(self) -> None:
+        """验证参数有效性"""
+        if self.total_steps <= 0:
+            raise ValueError(f"total_steps must be positive, got {self.total_steps}")
+        if not 0 < self.pct_start < 1:
+            raise ValueError(f"pct_start must be between 0 and 1, got {self.pct_start}")
+        if self.anneal_strategy not in ['cos', 'linear']:
+            raise ValueError(f"anneal_strategy must be one of ['cos', 'linear'], got {self.anneal_strategy}")
+
+    def _annealing_cos(self, start: float, end: float, pct: float) -> float:
+        """余弦退火"""
+        cos_out = math.cos(math.pi * pct) + 1
+        return end + (start - end) / 2.0 * cos_out
+
+    def _annealing_linear(self, start: float, end: float, pct: float) -> float:
+        """线性退火"""
+        return end + (start - end) * (1 - pct)
+
+    @torch.no_grad()
+    def get_lr(self) -> List[float]:
+        """计算当前学习率"""
+        if not self._get_lr_called_within_step:
+            logger.warning("To get the last learning rate computed by the scheduler, "
+                           "please use `get_last_lr()`.")
+
+        # 超出总步数
+        if self.last_epoch >= self.total_steps:
+            return [self._final_lr for _ in self.base_lrs]
+
+        lrs = []
+        for base_lr in self.base_lrs:
+            if self.last_epoch <= self._step_size_up:
+                # 上升阶段
+                lr = self._annealing_func(
+                    self._init_lr,
+                    self.max_lr,
+                    self.last_epoch / self._step_size_up
+                )
+            else:
+                # 下降阶段
+                down_step = self.last_epoch - self._step_size_up
+                lr = self._annealing_func(
+                    self.max_lr,
+                    self._final_lr,
+                    down_step / self._step_size_down
+                )
+            lrs.append(self._clip_lr(lr))
+
+        # 调整动量
+        if self.cycle_momentum:
+            self._adjust_momentum()
+
+        return lrs
+
+    def _adjust_momentum(self) -> None:
+        """调整动量参数"""
+        if not hasattr(self.optimizer, 'momentum'):
+            return
+
+        if self.last_epoch <= self._step_size_up:
+            # 上升阶段动量下降
+            momentum = self._annealing_func(
+                self.max_momentum,
+                self.base_momentum,
+                self.last_epoch / self._step_size_up
+            )
+        else:
+            # 下降阶段动量上升
+            down_step = self.last_epoch - self._step_size_up
+            momentum = self._annealing_func(
+                self.base_momentum,
+                self.max_momentum,
+                down_step / self._step_size_down
+            )
+
+        for param_group in self.optimizer.param_groups:
+            if 'momentum' in param_group:
+                param_group['momentum'] = momentum
+
+    @property
+    def _annealing_func(self) -> Callable[[float, float, float], float]:
+        """获取退火函数"""
+        return self._annealing_cos if self.anneal_strategy == 'cos' else self._annealing_linear
