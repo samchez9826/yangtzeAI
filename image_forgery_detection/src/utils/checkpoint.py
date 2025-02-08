@@ -611,7 +611,6 @@ class CheckpointManager:
             # 更新检查点列表
             for cp in removed:
                 self._checkpoints.remove(cp)
-
             self._save_state()
             logger.info(f"Removed {len(removed)} checkpoints")
 
